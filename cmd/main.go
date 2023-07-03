@@ -7,23 +7,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/mux"
 )
 
-var users = map[string]string{
-	"user1": "password1",
-	"user2": "password2",
-}
-
-var jwt_key = []byte("test123")
-
-type Credentials struct {
-	Password string `json:"password"`
+type Users struct {
+	Id       int    `json:"id"`
 	Username string `json:"username"`
+	Pass     string `json:"pass"`
 }
+
+var log_database = []Users{
+	{
+		Id:       1,
+		Username: "ersa",
+		Pass:     "1234567890",
+	},
+	{
+		Id:       2,
+		Username: "Adinda",
+		Pass:     "0987654321",
+	},
+}
+
+var jwt_key = []byte("-----BEGIN PUBLIC KEY-----\nMFswDQYJKoZIhvcNAQEBBQADSgAwRwJAWrUk4EsXW84HcWcjKgd8vqtkLpLz9/1w\nEktgcN/SdQhy/Z8X5NWVXZP/Kyx5kfH+nxTpRvvaqCZUkzqme7Vh0QIDAQAB\n-----END PUBLIC KEY-----")
+
+var privateKey, _ = rsa.GenerateKey(rand.Reader, 1024)
 
 type Claims struct {
 	Username string `json:"username"`
@@ -31,203 +43,176 @@ type Claims struct {
 }
 
 type response struct {
-	Username string      `json:"username"`
-	Data     interface{} `json:"data,omitempty"`
-}
-
-type rsa_response struct {
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
 
 func main() {
-	r := mux.NewRouter()
-	r.HandleFunc("/signin", signin).Methods("POST")
-	r.HandleFunc("/welcome", welcome).Methods("GET")
-	r.HandleFunc("/refresh", refresh).Methods("POST")
-	r.HandleFunc("/decrypt", decrypting).Methods("GET")
-	r.HandleFunc("/encrypt", encrypting).Methods("POST")
-	http.ListenAndServe(":8000", r)
 
+	r := mux.NewRouter()
+
+	r.HandleFunc("/signin", signin).Methods("POST")
+	r.HandleFunc("/", getAll).Methods("GET")
+	r.HandleFunc("/login", login).Methods("POST")
+	r.HandleFunc("/auth", auth).Methods("GET")
+	http.ListenAndServe(":8000", r)
 }
 
 func signin(w http.ResponseWriter, r *http.Request) {
-	var creds Credentials
+	var newUser Users
 
-	err := json.NewDecoder(r.Body).Decode(&creds)
+	err := json.NewDecoder(r.Body).Decode(&newUser)
 
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(response{
+			Message: "Create User Unsuccessful",
+		})
+	}
+
+	publicKey := privateKey.PublicKey
+
+	encryptedBytes, _ := rsa.EncryptOAEP(
+		sha256.New(),
+		rand.Reader,
+		&publicKey,
+		[]byte(newUser.Pass),
+		nil)
+	pass := string(encryptedBytes)
+	newUser.Pass = pass
+
+	newUser.Id = log_database[len(log_database)-1].Id + 1
+
+	log_database = append(log_database, newUser)
+
+	json.NewEncoder(w).Encode(response{
+		Message: "Create User Successful",
+		Data:    newUser,
+	})
+}
+
+func getAll(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(response{
+		Message: "get All User",
+		Data:    log_database,
+	})
+}
+
+func login(w http.ResponseWriter, r *http.Request) {
+	var newUser Users
+	var EncryptedPass string
+
+	err := json.NewDecoder(r.Body).Decode(&newUser)
+	enteredPass := newUser.Pass
+	username := newUser.Username
+
+	for _, v := range log_database {
+		if v.Username == username {
+			EncryptedPass = v.Pass
+		}
+	}
+	EncryptedPassByte := []byte(EncryptedPass)
+
+	if err != nil {
+		json.NewEncoder(w).Encode(response{
+			Message: "Login Failed",
+		})
 		return
 	}
 
-	expectedpw, ok := users[creds.Username]
+	decryptedPass, _ := rsa.DecryptOAEP(
+		sha256.New(),
+		rand.Reader,
+		privateKey,
+		EncryptedPassByte,
+		nil)
 
-	if !ok || expectedpw != creds.Password {
-		w.WriteHeader(http.StatusUnauthorized)
+	decryptedPassStr := string(decryptedPass)
+
+	// fmt.Printf("entered %s, decrypt %s", enteredPass, decryptedPass)
+
+	if decryptedPassStr != enteredPass {
+		json.NewEncoder(w).Encode(response{
+			Message: "Username or Password is invalid",
+		})
 		return
 	}
 
 	expiration := time.Now().Add(5 * time.Minute)
 
 	claims := &Claims{
-		Username: creds.Username,
+		Username: newUser.Username,
 		StandardClaims: jwt.StandardClaims{
 			ExpiresAt: expiration.Unix(),
 		},
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256,
+		claims)
 
-	tokenString, err := token.SignedString(jwt_key)
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:    "token",
-		Value:   tokenString,
-		Expires: expiration,
-	})
-
-	json.NewEncoder(w).Encode(response{
-		Username: claims.Username,
-		Data:     tokenString,
-	})
-}
-
-func welcome(w http.ResponseWriter, r *http.Request) {
-	c, err := r.Cookie("token")
+	tokenStr, err := token.SignedString(jwt_key)
 
 	if err != nil {
-		if err == http.ErrNoCookie {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	TknStr := c.Value
-
-	claims := &Claims{}
-
-	tkn, err := jwt.ParseWithClaims(TknStr, claims, func(token *jwt.Token) (interface{}, error) {
-		return jwt_key, nil
-	})
-
-	if err != nil {
-		if err == jwt.ErrSignatureInvalid {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	if !tkn.Valid {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	json.NewEncoder(w).Encode(response{
-		Username: fmt.Sprintf("Welcome %s", claims.Username),
-	})
-}
-
-func refresh(w http.ResponseWriter, r *http.Request) {
-	c, err := r.Cookie("token")
-
-	if err != nil {
-		if err == http.ErrNoCookie {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	tknstr := c.Value
-	claims := &Claims{}
-
-	tkn, err := jwt.ParseWithClaims(tknstr, claims, func(t *jwt.Token) (interface{}, error) {
-		return jwt_key, nil
-	})
-
-	if err != nil {
-		if err == jwt.ErrSignatureInvalid {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	if !tkn.Valid {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	if time.Unix(claims.ExpiresAt, 0).Sub(time.Now()) > 30*time.Second {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	expiration := time.Now().Add(5 * time.Minute)
-	claims.ExpiresAt = expiration.Unix()
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenstring, err := token.SignedString(jwt_key)
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:    "token",
-		Value:   tokenstring,
-		Expires: expiration,
-	})
-
-	json.NewEncoder(w).Encode(response{
-		Username: claims.Username,
-		Data:     tokenstring,
-	})
-}
-
-func decrypting(w http.ResponseWriter, r *http.Request) {
-
-}
-
-func encrypting(w http.ResponseWriter, r *http.Request) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-
-	if err != nil {
-		json.NewEncoder(w).Encode(rsa_response{
-			Message: "Generate Key Failed",
+		json.NewEncoder(w).Encode(response{
+			Message: "Login Failed",
 		})
+		return
 	}
 
-	publicKey := privateKey.PublicKey
-
-	encryptedBytes, err := rsa.EncryptOAEP(
-		sha256.New(),
-		rand.Reader,
-		&publicKey,
-		[]byte("super-duper secret message"),
-		nil)
-
-	if err != nil {
-		json.NewEncoder(w).Encode(rsa_response{
-			Message: "Encryption Failed",
-		})
-	}
-
-	json.NewEncoder(w).Encode(rsa_response{
-		Message: "Data Encrypted",
-		Data:    encryptedBytes,
+	json.NewEncoder(w).Encode(response{
+		Message: "Login Successful",
+		Data:    tokenStr,
 	})
 
+}
+
+func auth(w http.ResponseWriter, r *http.Request) {
+
+	authHeader := r.Header.Get("Authorization")
+	if !strings.Contains(authHeader, "Bearer") {
+		json.NewEncoder(w).Encode(response{
+			Message: "Token is Invalid",
+		})
+		return
+	}
+
+	user, err := extractToken(authHeader)
+
+	if err != nil {
+		json.NewEncoder(w).Encode(response{
+			Message: err.Error(),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(response{
+		Message: "Authorized User",
+		Data:    user,
+	})
+
+}
+
+func extractToken(auth string) (interface{}, error) {
+	claims := jwt.MapClaims{}
+
+	tokenStr := strings.Replace(auth, "Bearer ", "", -1)
+
+	fmt.Println(tokenStr)
+	fmt.Println(claims)
+
+	token, err := jwt.ParseWithClaims(tokenStr, claims,
+		func(t *jwt.Token) (interface{}, error) {
+			if method, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+				return nil, fmt.Errorf("signing Method Failed")
+			} else if method != jwt.SigningMethodRS256 {
+				return nil, fmt.Errorf("signing Method Failed")
+			}
+			return jwt_key, nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("error : %s", err)
+	}
+	if !token.Valid {
+		return nil, fmt.Errorf("token is not Valid")
+	}
+	return claims["user"], nil
 }
